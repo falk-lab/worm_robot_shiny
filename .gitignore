@@ -1,0 +1,6 @@
+# Ignore Microsoft temp files
+~#*
+
+# Ignore R files
+*.Rhistory
+*.Rproj.user
