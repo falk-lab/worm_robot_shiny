@@ -4,3 +4,9 @@
 # Ignore R files
 *.Rhistory
 *.Rproj.user
+
+# ignore specific files
+2024-11-26_raw_activity_ranked.csv
+example_code.html
+slc_raw.tsv
+make_example_data.Rmd
