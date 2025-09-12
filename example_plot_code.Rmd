@@ -1,0 +1,218 @@
+---
+output: html_document
+date: "2025-04-16"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(vroom)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+plate_map_path <- list.files('/Volumes/Falk_lab/Worm Robot/Plate Layout',
+                             pattern = 'SLC', full.names = T)
+data_folder_path <- list.files('/Volumes/Falk_lab/Worm Robot/data',
+                               pattern = 'SLC', full.names = T)
+```
+
+
+```{r}
+### read/wrangle/check plate maps
+tibble(well = c(paste0('A', 1:6),
+                paste0('B', 1:6),
+                paste0('C', 1:6),
+                paste0('D', 1:6))) %>%
+  separate(well, into = c('well_row', 'well_col'), sep = 1, remove = F) %>%
+  arrange(well_col, well_row) %>%
+  mutate(well_num = 1:24) %>%
+  select(well, well_num) -> well24_to_num
+
+plate_map_path %>%
+  enframe(name = NULL, value = 'file_path') %>%
+  filter(!str_detect(file_path, 'Master|0000-00-00_platemap_template.xlsx|~\\$')) %>%
+  mutate(file = str_remove(file_path, '.+/'),
+         plate = str_remove(file, '.xlsx'),
+         plate = str_remove(plate, 'platemap_'),
+         start_date = str_extract(file, '^[0-9\\.-]+'),
+         start_date = lubridate::ymd(start_date),
+         data = map(file_path, ~ readxl::read_excel(., skip = 12))) %>%
+  unnest(c(data)) %>%
+  mutate(across(contains('plate[ ]{0,1}[12]'), 
+                ~ ifelse(!(.x %in% LETTERS[1:4]), NA_character_, .x))) %>%
+  # unite(well_row, c(`...1`, `plate 2`, plate1, plate2), sep = '', na.rm = T) %>% 
+  # filter(!is.na(`1`), !str_detect(`1`, 'stock'), `1` != '1', `1` != '1000') %>%
+  rename(well_row = `1...1`) %>%
+  pivot_longer(`1...2`:`6`, names_to = 'well_col', values_to = 'well_info') %>%
+  mutate(well_col = str_remove(well_col, '...[0-9]+')) %>%
+  unite(well, c(well_row, well_col), sep = '') %>%
+  select(plate, start_date, well_info, well) %>%
+  group_by(plate, start_date) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = map(data, ~ platetools::plate_matrix(data = .$well_info, 
+                                                     well = .$well, 
+                                                     plate = 24)),
+         data = map(data, ~ platetools::rotate_plate(.)),
+         data = map(data, ~ as_tibble(.))) %>%
+  unnest(c(data)) %>%
+  mutate(well_row = rep(LETTERS[1:4], nrow(.) / 4))  %>%
+  pivot_longer(V1:V6, names_to = 'well_col', values_to = 'well_info') %>%
+  mutate(well_col = str_remove(well_col, 'V')) %>%
+  unite(well, c(well_row, well_col), sep = '') %>%
+  left_join(well24_to_num, by = 'well') -> plate_maps
+```
+
+```{r, eval = F}
+### check plate maps have wells appropriately named
+plate_maps %>%
+  filter(!(well %in% c(paste0('A', 1:6), paste0('B', 1:6),
+                       paste0('C', 1:6), paste0('D', 1:6)))) #%>% distinct(plate)
+
+### check plate maps have the correct numbers of wells
+plate_maps %>%
+  count(plate) %>%
+  filter(n != 24)
+
+### check plate maps have the correct numbers of conditions
+plate_maps %>%
+  count(plate, well_info)
+
+# plate_maps %>%
+#   filter(str_detect(plate, 'tyramine|DARS2'),
+#          plate != '2024-11-04_DARS2_WT') %>%
+#   count(plate, well_info)
+```
+
+```{r}
+c(fs::dir_ls(data_folder_path[1], recurse = T, glob = '*.csv'),
+  fs::dir_ls(data_folder_path[2], recurse = T, glob = '*.csv'),
+  fs::dir_ls(data_folder_path[3], recurse = T, glob = '*.csv'),
+  fs::dir_ls(data_folder_path[4], recurse = T, glob = '*.csv')) -> worm_robot_files
+
+worm_robot_files %>%
+  as.vector() %>%
+  enframe(name = NULL, value = 'file_path') %>%
+  filter(!str_detect(file_path, 'ROI_coordinates')) %>%
+  mutate(plate = str_remove(file_path, '/Volumes/Falk_lab/Worm Robot/data/'),
+         plate = str_remove(plate, '/.+'),
+         start_date = str_extract(plate, '^[0-9\\.-]+'),
+         start_date = str_remove(start_date, '-$'),
+         start_date = lubridate::ymd(start_date)) %>% 
+  filter(start_date > as.Date('2024-08-01')) %>%
+  group_by(start_date, plate) %>%
+  nest() %>%
+  ungroup() -> worm_robot_files_nested
+
+# worm_robot_files_nested %>%
+#   left_join(plate_maps, by = c('plate', 'start_date'))
+```
+
+```{r, warning = F, message = F}
+# get list of all available data tables
+measurement_locations <- NULL
+for (i in worm_robot_files_nested$plate) {
+  worm_robot_files_nested %>%
+    filter(plate == i) %>%
+    unnest(c(data)) %>%
+    filter(!str_detect(file_path, 'All Data|Stats Data|ActivityCurves')) -> loop_files
+  # print(head(loop_files))
+  for (j in loop_files$file_path) {
+    vroom(j, id = 'file_path', delim = ',') %>%
+      mutate(start_rownum = row_number()) %>%
+      filter(str_detect(`<ROI Number>`, '<')) %>%
+      mutate(measurement_clean = tolower(str_replace_all(str_remove_all(`<ROI Number>`, '<|>|,'), ' ', '_'))) %>%
+      select(file_path, measurement_clean, measurement_name = `<ROI Number>`,
+            start_rownum) %>%
+      arrange(start_rownum) %>%
+      mutate(end_rownum = lead(start_rownum) - 1,
+             date = str_remove_all(str_extract(file_path,
+                                           '_[0-9]{4}-[0-9]{2}-[0-9]{2} '),
+                               '_| '),
+              time = str_remove_all(str_extract(file_path,
+                                           '\\([0-9]{2}-[0-9]{2}-[0-9]{2}\\)'),
+                               '\\(|\\)'),
+             time = str_replace_all(time, '-', ':'),
+             snapshot = paste0(date, ' ', time)) %>%
+      filter(!str_detect(measurement_clean, 'group|annulus')) %>%
+      rbind(measurement_locations, .) -> measurement_locations
+  }
+}
+
+# measurement_locations %>%
+#   mutate(group = str_extract(file_path, '/Volumes/Falk_lab/Worm Robot/[A-z0-9\\.\\ _-]+/')) %>%
+#   distinct(group)
+```
+
+```{r, warning = F, message = F}
+measurement_locations %>%
+  filter(measurement_clean == 'worm_fraction') -> worm_frac_locations
+
+# get the worm fractions
+worm_frac <- NULL
+for (k in worm_frac_locations$file_path) { 
+  worm_frac_locations %>%
+    filter(file_path == k) -> temp_locations_worm_frac
+  
+  vroom(k, delim = ',', id = 'file_path',
+        skip = temp_locations_worm_frac$start_rownum + 1,
+        col_names = paste0(1:24),
+        col_types = 'dddddddddddddddddddddddd') %>%
+    head(1) %>%
+    pivot_longer(`1`:`24`, names_to = 'well_num', values_to = 'worm_fraction',
+               names_transform = list(well_num = as.integer)) %>%
+    # left_join(gas1_plate_map, by = 'well_num') %>%
+    mutate(snapshot = temp_locations_worm_frac$snapshot) %>%
+    select(file_path, snapshot, well_num, worm_fraction) %>%
+    rbind(worm_frac, .) -> worm_frac
+}
+```
+
+```{r, warning = F, message = F}
+# get activity
+measurement_locations %>%
+  filter(measurement_clean == 'roi_activity') -> activity_locations
+
+# get activity
+roi_activity <- NULL
+for (l in activity_locations$file_path) { 
+  activity_locations %>%
+    filter(file_path == l) -> temp_locations_roi_activity
+  
+  vroom(temp_locations_roi_activity$file_path, delim = ',', id = 'file_path',
+        skip = temp_locations_roi_activity$start_rownum + 1,
+        col_names = paste0(1:24),
+        col_types = 'dddddddddddddddddddddddd') %>%
+    select(-X25) %>%
+    head(temp_locations_roi_activity$end_rownum - temp_locations_roi_activity$start_rownum) %>%
+    mutate(picture = 1:nrow(.)) %>%
+    pivot_longer(`1`:`24`, names_to = 'well_num', values_to = 'roi_activity',
+               names_transform = list(well_num = as.integer)) %>%
+    mutate(snapshot = temp_locations_roi_activity$snapshot) %>%
+    select(file_path, snapshot, picture, well_num, roi_activity) %>%
+    rbind(roi_activity, .) -> roi_activity
+}
+```
+
+```{r}
+# combine data
+roi_activity %>%
+  left_join(worm_frac, by = join_by(file_path, snapshot, well_num)) %>%
+  left_join(unnest(worm_robot_files_nested, c(data)), 
+            by = join_by(file_path)) %>%
+  mutate(start_date = lubridate::ymd(start_date)) %>%
+  left_join(plate_maps, by = join_by(plate, well_num, start_date)) %>%
+  mutate(norm_activity = roi_activity * worm_fraction,
+         snapshot = lubridate::ymd_hms(snapshot)) %>%
+  select(plate, start_date, snapshot, picture, well, well_num, well_info,
+         worm_fraction, roi_activity, norm_activity) %>%
+  filter(start_date > as.Date('2024-09-01')) %>%
+  replace_na(list(well_info = 'water')) -> data
+```
+
+```{r}
+data %>%
+  write_tsv('slc_raw.tsv')
+```
+
