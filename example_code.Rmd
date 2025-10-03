@@ -18,6 +18,12 @@ knitr::opts_chunk$set(echo = F, message = F, warning = F)
 ```{r}
 ### read in combined raw data table
 vroom('example_data.csv') -> raw_data
+
+# vroom('old_example_data.csv') %>%
+#   # distinct(plate, well, well_info)
+#   mutate(well_info = ifelse(str_detect(well, '[4-6]$'), 'disease_model', 'N2')) %>%
+#   distinct(plate, well, well_info) %>%
+#   write_tsv('example_data.csv')
 ```
 
 ### Activity Data
