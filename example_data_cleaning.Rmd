@@ -1,0 +1,145 @@
+---
+output: html_document
+date: "2025-04-16"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(vroom)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+### read/wrangle/check plate maps
+tibble(well = c(paste0('A', 1:6),
+                paste0('B', 1:6),
+                paste0('C', 1:6),
+                paste0('D', 1:6))) %>%
+  separate(well, into = c('well_row', 'well_col'), sep = 1, remove = F) %>%
+  arrange(well_col, well_row) %>%
+  mutate(well_num = 1:24) %>%
+  select(well, well_num) -> well24_to_num
+
+## edit and simplify for Akul
+readxl::read_excel('raw_data_plate_map.xlsx', skip = 12) %>%
+  rename(well_row = `...1`) %>%
+  pivot_longer(`1`:`6`, names_to = 'well_col', values_to = 'well_info') %>%
+  unite(well, c(well_row, well_col), sep = '') %>%
+  select(well_info, well) %>%
+  nest() %>%
+  # flip plate because camera has it in the wrong orientation
+  mutate(data = map(data, ~ platetools::plate_matrix(data = .$well_info, 
+                                                     well = .$well, 
+                                                     plate = 24)),
+         data = map(data, ~ platetools::rotate_plate(.)),
+         data = map(data, ~ as_tibble(.))) %>%
+  unnest(c(data)) %>%
+  mutate(well_row = rep(LETTERS[1:4], nrow(.) / 4))  %>%
+  pivot_longer(V1:V6, names_to = 'well_col', values_to = 'well_info') %>%
+  mutate(well_col = str_remove(well_col, 'V')) %>%
+  unite(well, c(well_row, well_col), sep = '') %>%
+  left_join(well24_to_num, by = 'well') -> plate_maps
+```
+
+```{r}
+# list data files
+unzip('raw_data.zip', list = T) %>%
+  filter(str_detect(Name, 'Session')) %>%
+  select(Name) %>%
+  deframe() -> worm_robot_files
+```
+
+```{r, warning = F, message = F}
+measurement_locations <- NULL
+for (j in worm_robot_files) {
+  vroom(unz('raw_data.zip', j), id = 'file_path', delim = ',') %>%
+    mutate(start_rownum = row_number()) %>%
+    filter(str_detect(`<ROI Number>`, '<')) %>%
+    mutate(measurement_clean = tolower(str_replace_all(str_remove_all(`<ROI Number>`, '<|>|,'), ' ', '_'))) %>%
+    select(file_path, measurement_clean, measurement_name = `<ROI Number>`,
+          start_rownum) %>%
+    arrange(start_rownum) %>%
+    mutate(end_rownum = lead(start_rownum) - 1,
+           date = str_remove_all(str_extract(file_path,
+                                             '_[0-9]{4}-[0-9]{2}-[0-9]{2} '),
+                                 '_| '),
+           time = str_remove_all(str_extract(file_path,
+                                             '\\([0-9]{2}-[0-9]{2}-[0-9]{2}\\)'),
+                                '\\(|\\)'),
+           time = str_replace_all(time, '-', ':'),
+           snapshot = paste0(date, ' ', time)) %>%
+    filter(!str_detect(measurement_clean, 'group|annulus')) %>%
+    rbind(measurement_locations, .) -> measurement_locations
+}
+```
+
+```{r, warning = F, message = F}
+measurement_locations %>%
+  filter(measurement_clean == 'worm_fraction') -> worm_frac_locations
+
+# get the worm fractions
+worm_frac <- NULL
+for (k in worm_robot_files) { 
+  worm_frac_locations %>%
+    filter(str_detect(file_path, 
+                      str_replace(str_replace(k, '\\(', '\\\\('), 
+                                  '\\)', '\\\\)'))) -> temp_locations_worm_frac
+  
+  vroom(unz('raw_data.zip', k), id = 'file_path', delim = ',',
+        skip = temp_locations_worm_frac$start_rownum + 1,
+        col_names = paste0(1:24),
+        col_types = 'dddddddddddddddddddddddd') %>%
+    head(1) %>%
+    pivot_longer(`1`:`24`, names_to = 'well_num', values_to = 'worm_fraction',
+               names_transform = list(well_num = as.integer)) %>%
+    mutate(snapshot = temp_locations_worm_frac$snapshot) %>%
+    select(file_path, snapshot, well_num, worm_fraction) %>%
+    rbind(worm_frac, .) -> worm_frac
+}
+```
+
+```{r, warning = F, message = F}
+# get activity
+measurement_locations %>%
+  filter(measurement_clean == 'roi_activity') -> activity_locations
+
+# get activity
+roi_activity <- NULL
+for (l in worm_robot_files) { 
+  activity_locations %>%
+    filter(str_detect(file_path, 
+                      str_replace(str_replace(l, '\\(', '\\\\('), 
+                                  '\\)', '\\\\)'))) -> temp_locations_roi_activity
+  
+  vroom(unz('raw_data.zip', l), delim = ',', id = 'file_path',
+        skip = temp_locations_roi_activity$start_rownum + 1,
+        col_names = paste0(1:24),
+        col_types = 'dddddddddddddddddddddddd') %>%
+    select(-X25) %>%
+    head(temp_locations_roi_activity$end_rownum - temp_locations_roi_activity$start_rownum) %>%
+    mutate(picture = 1:nrow(.)) %>%
+    pivot_longer(`1`:`24`, names_to = 'well_num', values_to = 'roi_activity',
+               names_transform = list(well_num = as.integer)) %>%
+    mutate(snapshot = temp_locations_roi_activity$snapshot) %>%
+    select(file_path, snapshot, picture, well_num, roi_activity) %>%
+    rbind(roi_activity, .) -> roi_activity
+}
+```
+
+```{r}
+# combine data
+roi_activity %>%
+  select(-file_path) %>%
+  left_join(worm_frac, by = join_by(snapshot, well_num)) %>% 
+  mutate(start_date = str_extract(snapshot, '[0-9]{4}-[0-9]{2}-[0-9]{2}'),
+         start_date = lubridate::ymd(start_date)) %>%
+  left_join(plate_maps, by = join_by(well_num)) %>%
+  mutate(norm_activity = roi_activity * worm_fraction,
+         snapshot = lubridate::ymd_hms(snapshot)) %>%
+  select(snapshot, picture, well, well_num, well_info,
+         worm_fraction, roi_activity, norm_activity) %>%
+  replace_na(list(well_info = 'water')) -> data
+```
+
+
